@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import sqlite3
+import sys
 from decimal import Decimal, ROUND_FLOOR, getcontext
 
 # 判定中出现的小数位数有界（坐标串约 17 位 + 微度换算 6 位），50 位足够精确
@@ -663,6 +664,25 @@ def _print(obj):
     print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
 
 
+def _int_microdegrees(text):
+    """argparse 类型：严格整数微度（拒绝小数、指数、下划线等形式）。"""
+    s = text.strip()
+    digits = s[1:] if s[:1] in ("+", "-") else s
+    if not digits or not digits.isdigit():
+        raise argparse.ArgumentTypeError(f"窗口四至必须是整数微度: {text!r}")
+    return int(s)
+
+
+def _connect_readonly(path):
+    """以只读模式打开数据库（审计命令用，从连接层面保证不改库）。"""
+    from urllib.parse import quote
+    conn = sqlite3.connect(f"file:{quote(path, safe='/')}?mode=ro",
+                           uri=True, timeout=10.0)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(
         prog="dispatch", description="局部可维护的派单名册（与 merger 共用同一 SQLite 库）")
@@ -675,6 +695,14 @@ def main(argv=None):
     sp.add_argument("db"); sp.add_argument("--out", help="输出到文件，默认标准输出")
     sp = sub.add_parser("validate-geometry", help="只校验一个区/区表 JSON，不写库")
     sp.add_argument("file")
+    sp = sub.add_parser(
+        "audit-coverage",
+        help="只读覆盖审计：报告窗口内漏划/重叠区域的精确面积与定位点")
+    sp.add_argument("db")
+    sp.add_argument("--window", nargs=4, type=_int_microdegrees, required=True,
+                    metavar=("MIN_LON", "MIN_LAT", "MAX_LON", "MAX_LAT"),
+                    help="检查窗口四至（整数微度，严格正宽高）")
+    sp.add_argument("--out", help="输出到文件，默认标准输出")
     args = p.parse_args(argv)
 
     if args.cmd == "validate-geometry":
@@ -683,6 +711,28 @@ def main(argv=None):
             _print({"ok": True, "polygon": validate_polygon(payload["geometry"])})
         else:
             _print({"ok": True, "zones": list(normalize_zones(payload))})
+        return
+
+    if args.cmd == "audit-coverage":
+        import coverage_audit
+        try:
+            conn = _connect_readonly(args.db)
+            try:
+                report = coverage_audit.audit_coverage(
+                    conn, tuple(args.window))
+            finally:
+                conn.close()
+        except (coverage_audit.AuditError, sqlite3.Error, OSError) as e:
+            # 没有已建名册或窗口无效：非零退出，不输出貌似成功的报告
+            print(f"audit-coverage: error: {e}", file=sys.stderr)
+            raise SystemExit(1)
+        text = json.dumps(report, ensure_ascii=False, indent=2)
+        if args.out:
+            open(args.out, "w", encoding="utf-8").write(text + "\n")
+            _print({"revision": report["revision"],
+                    "region_count": report["region_count"], "out": args.out})
+        else:
+            print(text)
         return
 
     conn = connect(args.db)
