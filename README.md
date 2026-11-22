@@ -253,3 +253,177 @@ python3 coverage_audit_test.py
 另验证改区提交与读取交错（未提交写、读事务中插入提交）时报告始终配对同一
 已提交版本的修订号与几何，以及无名册/非法窗口时 CLI 非零退出（151 项）。
 
+
+---
+
+# 站点同步（sync_center.py / sync_site.py）
+
+后场断网时站点仍要用本机 SQLite 查单。中心端把派单名册**按站点切成增量**：
+站点先取走自己负责的地址（初装包），之后只接收自己与上一版的**净变化**（补丁），
+在一次事务里把地址表与版本游标推进到补丁指明的名册版本。
+
+- 站点由**派单结果里的区 ID** 确定（区 → 站点映射），与多边形相交/覆盖签名无关。
+  一个地址属于哪个站，只看它 `roster_records.zone_id` 落在哪个区的站点。
+- 中心端与站点端各一个 CLI；不做网络传输（包就是 JSON 文件）。
+
+## 中心端：启用、初装、补丁
+
+```bash
+# 1) 建册时顺手给出区 -> 站点静态映射（也可建成后由 enable --site-zones 整理）
+python3 dispatch.py build geo.db zones.json --site-zones site_zones.json
+
+# 2) 在已有名册上启用同步（幂等；重复启用返回原身份与起点）
+python3 sync_center.py enable geo.db
+python3 sync_center.py sites geo.db                 # 列出发布源 ID 与已知站点
+
+# 3) 初装包：站点在目标修订当前已提交的全部派单地址
+python3 sync_center.py export-initial geo.db SITE_A --target 1 --out a_init.json
+
+# 4) 补丁：站点 + 起始修订 + 目标修订（两端都须是启用以来已提交的版本）
+python3 sync_center.py export-patch geo.db SITE_A --from 1 --to 4 --out a_1_4.json
+```
+
+启用（`enable_sync`）：
+
+| 行为 | 说明 |
+|---|---|
+| 最早同步版本 | 记下启用当时的名册修订号为 `enabled_revision`；更早的版本**不编造历史**、不可导出 |
+| 发布源 ID | 存库的随机 `SRC-…`，进程重启不变；独立启用的另一个中心库分配到的值不同 |
+| 重复启用 | 幂等返回原 `source_id` / `enabled_revision`；映射已锁定，若再次传入不同映射则拒绝 |
+| 一次性整理 | 只整理区 → 站点映射（`dz_zone_sites` → 发布映射 `sync_zone_site`），**不改名册记录与修订号** |
+
+启用后继续用原来的 `dispatch.py build / apply` 改区。改区成功提交时，
+站点净变化与派单记录、修订号在**同一事务**里生效：
+
+- 只比较本批重算过的地址的旧/新站点，不为写同步记录而遍历整册；
+- 未实际换站的地址不写事件；同一批内转了又回（净零）不写事件；
+- 被拒或未提交的改区不产生任何可导出的变化；
+- 删区时先写净变化、再移除该区的发布映射，所以**原站一定收到删除**，
+  即使它最后一个区已被删除（站点登记在 `sync_sites`，仍可导出）。
+
+覆盖审计（`audit-coverage`）与地理编码快照（merger 各表）的行为不变。
+
+## 同步包格式（JSON，字段固定）
+
+初装包：
+
+```json
+{
+  "protocol": "dispatch-site-sync/1",
+  "package_type": "initial",
+  "source_id": "SRC-3F9C...",
+  "site_id": "SITE_A",
+  "target_revision": 1,
+  "items": [
+    {"source_row": "R_A_1", "lon": 100.5, "lat": 40.5}
+  ]
+}
+```
+
+补丁：
+
+```json
+{
+  "protocol": "dispatch-site-sync/1",
+  "package_type": "patch",
+  "source_id": "SRC-3F9C...",
+  "site_id": "SITE_A",
+  "from_revision": 1,
+  "target_revision": 4,
+  "items": [
+    {"op": "add", "source_row": "R_NEW", "lon": 100.3, "lat": 40.3, "zone_id": "M"},
+    {"op": "del", "source_row": "R_OLD"}
+  ]
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `protocol` | 固定 `dispatch-site-sync/1`，站点端不认别的值 |
+| `package_type` | `initial` 或 `patch` |
+| `source_id` | 中心库的发布源 ID（站点初装后固定，不得改变） |
+| `site_id` | 本包的目标站点（站点初装后固定） |
+| `from_revision` | 仅补丁：补丁起点，必须等于站点当前修订号 |
+| `target_revision` | 应用后站点应到达的名册修订号 |
+| `items[].op` | 仅补丁：`add` 或 `del`；初装包省略（全部视为新增） |
+| `items[].source_row` | 地址稳定 ID，全包严格升序 |
+| `items[].lon` / `lat` | 名册中的选定经纬度（度数，REAL）；初装包只给这两个字段 |
+| `items[].zone_id` | 仅补丁的 `add` 项：中心端当前归属，仅供核对，不作收件依据 |
+
+补丁只交付**两个版本之间的净差**：
+
+- 起点不在本站、终点在 → 完整地址行（`add`）；
+- 起点在、终点不在 → 删除项（`del`）；
+- 两端都在或都不在（含中途转走又调回）→ 不发；
+- 无变化也给可应用、能推进版本的空补丁（`items: []`）。
+
+导出实现按 `(site_id, source_row, sync_revision)` / `(site_id, sync_revision)`
+索引把区间内**本站**事件折叠成起点/终点状态：不扫完整名册、不遍历其他站点，
+也不随空修订或无关修订的个数增长。地址项一律按 `source_row` 排序，同一请求对
+同一版本重复导出逐字节一致；三个版本之后仍可按原目标版本重导同一补丁。
+
+## 站点端：应用与查看
+
+```bash
+python3 sync_site.py init site_a.db                      # 建空站点库
+python3 sync_site.py apply site_a.db a_init.json         # 初装（固定发布源与站点）
+python3 sync_site.py apply site_a.db a_1_4.json          # 应用补丁
+python3 sync_site.py apply site_a.db a_1_4.json --dry-run # 只校验不写库
+
+# 查看本站当前修订号与当前地址（含经纬度），
+# 或 --out 把地址表单独写文件（剩余摘要仍打印到标准输出）
+python3 sync_site.py show site_a.db
+python3 sync_site.py show site_a.db --out addresses.json
+```
+
+站点库的表：
+
+| 表 | 内容 |
+|---|---|
+| `ss_meta` | `source_id`、`site_id`（初装后固定）、`revision`（当前名册版本）、`last_digest`（最近成功应用包的内容摘要） |
+| `ss_addresses` | 本站当前派单地址：`source_row`、`lon`、`lat` |
+| `ss_applied` | 应用历史：包类型、起止版本、条数、内容摘要、原包 JSON |
+
+直接用 SQLite 查阅：
+
+```bash
+sqlite3 site_a.db "SELECT value FROM ss_meta WHERE key='revision';"
+sqlite3 site_a.db "SELECT source_row, lon, lat FROM ss_addresses ORDER BY source_row;"
+```
+
+应用规则（全部在任何写操作之前校验，失败不改库）：
+
+1. **身份**：`source_id` / `site_id` 必须与本站固定身份一致；
+2. **版本**：补丁 `from_revision` 必须等于本机当前修订号；缺版、跳版、倒序一律拒绝；
+3. **包类型**：初装包只能应用到空库；已初装后再次初装被拒（不会重置本站）；
+4. **项自洽**：地址项必须严格升序；`add` 的地址不得已存在，`del` 的地址必须存在；
+   任一冲突整包拒绝，**不留下部分结果**；
+5. **原子性**：地址表与版本游标、应用历史在同一个事务提交；
+6. **幂等重放**：原样重送**最近一次成功应用**的包 → 成功返回 `replayed`、无任何副作用；
+   版本区间相同但内容不同的另一份包 → 拒绝（不能借重送偷换内容）。
+
+## 表结构（中心库新增）
+
+`sync_meta`（发布源 ID、启用版本、singleton）、`sync_zone_site`（启用后随改区演进的
+发布映射，可删区）、`sync_zone_sites`（启用时的一次性整理快照）、
+`sync_sites`（已知站点登记）、`sync_changes`（按 `(sync_revision, site_id, source_row)`
+记录的站点净变化，`op` 为 `add`/`del`）。merger 各表与只读触发器不变。
+
+## 示例与测试
+
+```bash
+python3 sync_example.py
+```
+
+可复跑示例（临时目录建库）构造一条修订链：地址 `R_MOVE_1` 由甲站转到乙站、
+又转回甲站、再转回乙站后不再回来；另一个地址 `R_DEL` 因区被删除而离开原站。
+手写 rev1/2/3/4/5/6/7/13 各站地址集，逐版本核对；核对旧目标版本的补丁、
+跨版净差、空补丁、删除项、转了又回不发、重复导出一致；核对站点应用结果与
+错序、缺版、身份不符、重复项、冲突项整包拒绝后本地版本与地址逐字节不变；
+另让一次改区停在提交前，在独立连接上确认目标版本不可导出；对一个只涉及少量
+本站变化的长区间，用 `EXPLAIN QUERY PLAN`（`SEARCH … USING INDEX
+idx_sync_changes_site_rev`）与 SQL 追踪（折叠只发一条 `sync_changes` 区间查询、
+不扫 `roster_addresses`/`roster_records`）说明导出不随其他站点记录或空修订增长；
+并覆盖另一中心库累积 25 个无关修订后同一区间仍为空补丁、可逐个应用推进版本。
+CLI 冒烟覆盖 `enable` / `export-initial` / `export-patch` / `apply` / `show`
+以及倒序导出的非零退出。

@@ -29,6 +29,14 @@
   新版。写连接以 ``BEGIN IMMEDIATE`` 抢保留锁，同一预期号的并发写至多一个
   成功；写进程提交前退出，事务随连接关闭而回滚，可从上一版继续。
 
+站点同步
+--------
+建册时可同时给出 ``site_zones``（区 ID -> 站点 ID，或按站点给区 ID 列表），
+静态映射存于 ``dz_zone_sites``。中心库启用同步后，每次改区在同一事务中把
+“地址换了站点”的净变化写入 ``sync_changes``（见 ``sync_common``）：只针对
+本批重算过的地址，按旧/新站点比较，不遍历整册，也不为无变化的修订写事件。
+站点以区 ID 标识，与多边形相交/覆盖签名无关。
+
 merger 的原有表与触发器一律不改动、不写入。
 """
 from __future__ import annotations
@@ -38,6 +46,8 @@ import json
 import sqlite3
 import sys
 from decimal import Decimal, ROUND_FLOOR, getcontext
+
+import sync_common
 
 # 判定中出现的小数位数有界（坐标串约 17 位 + 微度换算 6 位），50 位足够精确
 getcontext().prec = 50
@@ -356,6 +366,13 @@ CREATE TABLE IF NOT EXISTS roster_revisions (
   detail_json    TEXT NOT NULL,
   created_at     TEXT NOT NULL
 );
+-- 区 -> 站点静态映射（站点以区 ID 标识）。建册时写入；启用同步后锁定。
+CREATE TABLE IF NOT EXISTS dz_zone_sites (
+  zone_id  TEXT PRIMARY KEY,
+  site_id  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dz_zone_sites_site
+  ON dz_zone_sites(site_id, zone_id);
 """
 
 
@@ -384,6 +401,69 @@ def fixed_snapshot_id(conn) -> int | None:
 def _now() -> str:
     import datetime
     return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def normalize_site_zones(site_zones, zone_ids=()):
+    """规整区 -> 站点映射。
+
+    接受两种形态：
+    * ``{"Z1": "SITE_A", ...}``（区 ID -> 站点 ID）
+    * ``{"SITE_A": ["Z1", "Z2"], ...}``（站点 ID -> 区 ID 列表）
+    返回 ``{zone_id: site_id}``。一个区只能属于一个站点；同一站点重复列出
+    同一个区视为同一事实（幂等），不同站点抢同一个区则报错。
+    """
+    if site_zones is None:
+        return {}
+    if not isinstance(site_zones, dict):
+        raise RosterError("site_zones 必须是对象")
+    known = set(zone_ids)
+    out = {}
+
+    def put(zid, sid):
+        if not isinstance(zid, str) or not zid:
+            raise RosterError(f"区 ID 必须是非空字符串: {zid!r}")
+        if not isinstance(sid, str) or not sid:
+            raise RosterError(f"站点 ID 必须是非空字符串: {sid!r}")
+        prev = out.get(zid)
+        if prev is not None and prev != sid:
+            raise RosterError(f"区 {zid} 同时被映射到站点 {prev} 与 {sid}")
+        out[zid] = sid
+
+    for k, v in site_zones.items():
+        if isinstance(v, str):
+            put(k, v)
+        elif isinstance(v, list) and all(isinstance(x, str) for x in v):
+            for zid in v:
+                put(zid, k)
+        else:
+            raise RosterError(
+                f"site_zones 值必须是站点 ID 或区 ID 列表: {k}={v!r}")
+    if known:
+        bad = sorted(set(out) - known)
+        if bad:
+            raise RosterError(f"站点映射包含不在区表中的区: {bad}")
+    return out
+
+
+def zone_site_map(conn) -> dict:
+    """读区 -> 站点映射。
+
+    名册自身的静态映射在建册时写入 ``dz_zone_sites``；同步启用后，中心端的
+    发布映射 ``sync_zone_site`` 是唯一有效来源（启用时整体整理而来，此后随
+    改区演进、可删区）。两者都没有时返回空映射。
+    """
+    tables = {r["name"] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'")}
+    if "sync_meta" in tables and conn.execute(
+            "SELECT 1 FROM sync_meta WHERE key='source_id'").fetchone() is not None:
+        if "sync_zone_site" in tables:
+            return {r["zone_id"]: r["site_id"] for r in conn.execute(
+                "SELECT zone_id, site_id FROM sync_zone_site")}
+        return {}
+    if "dz_zone_sites" not in tables:
+        return {}
+    return {r["zone_id"]: r["site_id"] for r in conn.execute(
+        "SELECT zone_id, site_id FROM dz_zone_sites")}
 
 
 def _load_polygons(conn):
@@ -425,9 +505,14 @@ def _assign(px, py, polys):
 
 # ---------------------------------------------------------------- 首次建册
 
-def build_roster(conn, zones, snapshot_id=None) -> dict:
-    """首次建册：固定一个成功快照，以其 selections 为地址全集，产生 revision 1。"""
+def build_roster(conn, zones, snapshot_id=None, site_zones=None) -> dict:
+    """首次建册：固定一个成功快照，以其 selections 为地址全集，产生 revision 1。
+
+    ``site_zones`` 可选：区 -> 站点静态映射（见 ``normalize_site_zones``）；
+    与区表在同一个事务里写入 ``dz_zone_sites``。
+    """
     norm = normalize_zones(zones)
+    site_map = normalize_site_zones(site_zones, zone_ids=norm.keys())
     if roster_exists(conn) and current_revision(conn) is not None:
         raise RosterError("名册已存在：建册只能执行一次，后续改动请走改区批次")
     if snapshot_id is None:
@@ -449,6 +534,7 @@ def build_roster(conn, zones, snapshot_id=None) -> dict:
     old_level = conn.isolation_level
     conn.isolation_level = None
     conn.executescript(SCHEMA)
+    sync_common.ensure_sync_tables(conn)
     conn.execute("BEGIN IMMEDIATE")
     try:
         # 外键检查延迟到提交点：改区时先删区后重写派单，提交时引用必须重新有效
@@ -460,6 +546,9 @@ def build_roster(conn, zones, snapshot_id=None) -> dict:
             conn.execute("INSERT INTO dz_zones VALUES (?,?,?,?,?,?,?)",
                          (zid, z["priority"], z["geometry_json"],
                           minx, miny, maxx, maxy))
+        for zid, sid in site_map.items():
+            conn.execute("INSERT INTO dz_zone_sites(zone_id, site_id) VALUES (?,?)",
+                         (zid, sid))
         polys = _load_polygons(conn)
         n_assigned = n_uncovered = n_no_coord = 0
         for s in sels:
@@ -503,7 +592,32 @@ def build_roster(conn, zones, snapshot_id=None) -> dict:
     return {"snapshot_id": snapshot_id, "revision": 1,
             "addresses": len(sels), "assigned": n_assigned,
             "uncovered": n_uncovered, "no_coordinate": n_no_coord,
-            "zones": len(norm)}
+            "zones": len(norm), "site_zones": len(site_map)}
+
+
+def set_site_zones(conn, site_zones) -> dict:
+    """替换区 -> 站点静态映射（仅供 ``sync_center.enable_sync`` 的一次性整理使用）。
+
+    同步启用后区映射被锁定；普通改区不经此函数。
+    """
+    mapping = normalize_site_zones(site_zones)
+    old_level = conn.isolation_level
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("CREATE TABLE IF NOT EXISTS dz_zone_sites ("
+                     " zone_id TEXT PRIMARY KEY, site_id TEXT NOT NULL)")
+        conn.execute("DELETE FROM dz_zone_sites")
+        for zid, sid in mapping.items():
+            conn.execute("INSERT INTO dz_zone_sites(zone_id, site_id) VALUES (?,?)",
+                         (zid, sid))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.isolation_level = old_level
+    return {"zones": len(mapping)}
 
 
 # ---------------------------------------------------------------- 局部改区
@@ -546,6 +660,10 @@ def apply_changes(conn, batch, expected_revision=None, commit=True) -> dict:
     try:
         conn.execute("BEGIN IMMEDIATE")          # 抢保留锁：并发写至多一个成功
         conn.execute("PRAGMA defer_foreign_keys=ON")
+        # 自愈：旧库若没有站点映射表/同步表，按已提交的区表补建（幂等，不扫地址）
+        conn.execute("CREATE TABLE IF NOT EXISTS dz_zone_sites ("
+                     " zone_id TEXT PRIMARY KEY, site_id TEXT NOT NULL)")
+        sync_common.ensure_sync_tables(conn)
         cur = current_revision(conn)
         if cur is None:
             raise RosterError("名册尚未建立，请先建册")
@@ -558,6 +676,29 @@ def apply_changes(conn, batch, expected_revision=None, commit=True) -> dict:
         for zid, z in changes.items():
             if z is None and zid not in old_zones:
                 raise RosterError(f"删除失败：区 {zid} 当前不存在")
+        # 启用同步后：批次新引入的区必须有站点映射，并整理进发布映射（同事务）。
+        # 已删区的发布映射先保留，等净变化事件写完再删（原站要收到删除）。
+        sync_on = sync_common.sync_enabled(conn)
+        old_site_map = sync_common.site_zone_map(conn) if sync_on else {}
+        if sync_on:
+            for zid, z in changes.items():
+                published = conn.execute(
+                    "SELECT 1 FROM sync_zone_site WHERE zone_id=?", (zid,)).fetchone()
+                static = conn.execute(
+                    "SELECT site_id FROM dz_zone_sites WHERE zone_id=?", (zid,)
+                ).fetchone()
+                if published is None and static is None:
+                    raise RosterError(
+                        f"区 {zid} 没有站点映射；同步启用后不能新引入未映射的区")
+                if z is not None and published is None:
+                    conn.execute(
+                        "INSERT INTO sync_zone_site(zone_id, site_id) VALUES (?,?)",
+                        (zid, static["site_id"]))
+                    sync_common.register_site(
+                        conn, static["site_id"], current_revision(conn) + 1)
+        for zid, z in changes.items():
+            if z is None:
+                conn.execute("DELETE FROM dz_zone_sites WHERE zone_id=?", (zid,))
         # 逐区收集旧/新外环闭合外包矩形，保持为独立矩形的并集（不做大矩形合并）
         boxes, touched_zones = [], []
         for zid, z in changes.items():
@@ -576,6 +717,10 @@ def apply_changes(conn, batch, expected_revision=None, commit=True) -> dict:
             per_box_hits.append({"bbox": list(bbox), "addresses": len(rows)})
             for r in rows:
                 affected[r["source_row"]] = r
+        # 只对受影响地址取旧归属区：按主键点查，不扫整册
+        old_zone_of = {sr: (conn.execute(
+            "SELECT zone_id FROM roster_records WHERE source_row=?", (sr,)
+        ).fetchone()["zone_id"]) for sr in affected}
         # 写入批次最终区表
         for zid, z in changes.items():
             if z is None:
@@ -593,6 +738,8 @@ def apply_changes(conn, batch, expected_revision=None, commit=True) -> dict:
         polys = _load_polygons(conn)               # 批次最终区表（含未编辑的区）
         new_rev = cur + 1
         recomputed = []
+        # 按“旧归属区”分组重算后的地址，供事务内写站点净变化
+        recomputed_by_old = {}
         for sr, r in sorted(affected.items()):
             px, py = Decimal(r["lon_text"]), Decimal(r["lat_text"])
             status, zid = _assign(px, py, polys)  # 未编辑的区也可能接手/仍获胜
@@ -600,6 +747,18 @@ def apply_changes(conn, batch, expected_revision=None, commit=True) -> dict:
                 "UPDATE roster_records SET status=?, zone_id=?, last_revision=? "
                 "WHERE source_row=?", (status, zid, new_rev, sr))
             recomputed.append({"source_row": sr, "status": status, "zone_id": zid})
+            recomputed_by_old.setdefault(old_zone_of[sr], []).append(sr)
+        # 站点同步：与名册记录、修订号同事务生效；只覆盖本批重算地址。
+        if sync_common.sync_enabled(conn):
+            sync_common.record_dispatch_delta(
+                conn, new_rev,
+                sorted(recomputed_by_old.items(),
+                       key=lambda kv: (kv[0] is None, kv[0] or "")),
+                old_site_map)
+            # 站点变化事件写完后才移除已删区的发布映射
+            for zid, z in changes.items():
+                if z is None:
+                    conn.execute("DELETE FROM sync_zone_site WHERE zone_id=?", (zid,))
         conn.execute("UPDATE dz_meta SET value=? WHERE key='revision'", (str(new_rev),))
         detail = {"touched_zones": touched_zones,
                   "bboxes": [list(b) for b in boxes],
@@ -689,6 +848,7 @@ def main(argv=None):
     sub = p.add_subparsers(dest="cmd", required=True)
     sp = sub.add_parser("build", help="首次建册（完整区表，产生修订号 1）")
     sp.add_argument("db"); sp.add_argument("zones_file"); sp.add_argument("--snapshot", type=int)
+    sp.add_argument("--site-zones", help="区 -> 站点映射 JSON（建册时固定的静态映射）")
     sp = sub.add_parser("apply", help="应用改区批次（预期修订号 + JSON 批次）")
     sp.add_argument("db"); sp.add_argument("batch_file")
     sp = sub.add_parser("read", help="读取当前版完整名册")
@@ -739,7 +899,9 @@ def main(argv=None):
     try:
         if args.cmd == "build":
             zones = json.load(open(args.zones_file, encoding="utf-8"))
-            _print(build_roster(conn, zones, args.snapshot))
+            site_zones = (json.load(open(args.site_zones, encoding="utf-8"))
+                          if args.site_zones else None)
+            _print(build_roster(conn, zones, args.snapshot, site_zones))
         elif args.cmd == "apply":
             text = open(args.batch_file, encoding="utf-8").read()
             batch = normalize_batch(text)
